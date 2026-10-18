@@ -6,6 +6,8 @@ conspiracy talk) and for signs of credible reporting (named sources, quotes,
 figures, balance). It CANNOT verify whether a claim is true.
 """
 
+import html
+import math
 import re
 
 MIN_WORDS = 30
@@ -88,7 +90,7 @@ def _clean_snippet(text):
     return re.sub(r"\s+", " ", text.replace("`", "'")).strip()
 
 
-def analyze(text, headline=""):
+def analyze(text, headline="", strictness=1.0):
     text = (text or "").strip()
     headline = (headline or "").strip()
     if len(text) > MAX_CHARS:
@@ -115,8 +117,15 @@ def analyze(text, headline=""):
         cred_points += points
         credibility.append({"title": title, "detail": detail, "points": points})
 
+    highlights = []
+
+    def mark(terms, category):
+        for t in terms:
+            highlights.append((t, category))
+
     # ---------------- Red flags ----------------
     found = _find_terms(SENSATIONAL, lowered)
+    mark(found, "sensational")
     if found:
         add_flag("Sensational or emotional wording",
                  "Reliable reporting usually uses neutral language. Hype words try to trigger emotion instead of informing.",
@@ -125,6 +134,7 @@ def analyze(text, headline=""):
     if headline:
         hl = headline.lower().replace("\u2019", "'")
         hl_found = _find_terms(CLICKBAIT_HEADLINE, hl)
+        mark(hl_found, "sensational")
         hl_notes = list(hl_found)
         if re.match(r"^\s*\d+\s+(things|reasons|ways|secrets|facts|signs|tricks)\b", hl):
             hl_notes.append("numbered list headline")
@@ -141,6 +151,7 @@ def analyze(text, headline=""):
     caps = [w for w in re.findall(r"\b[A-Z]{4,}\b", full) if w not in OK_ACRONYMS]
     caps_distinct = sorted(set(caps))
     if len(caps) >= 3:
+        mark(caps_distinct, "caps")
         add_flag("Words written in ALL CAPS",
                  "Shouting in capital letters is a common tactic to create urgency or outrage.",
                  caps_distinct[:8], min(15, 2 * len(caps)))
@@ -152,24 +163,28 @@ def analyze(text, headline=""):
                  [str(exclaims) + " exclamation marks"], min(10, 2 * exclaims))
 
     found = _find_terms(ABSOLUTE, lowered)
+    mark(found, "absolute")
     if found:
         add_flag("Absolute or exaggerated claims",
                  "Words like 'always', 'never' and '100%' overstate certainty. Real evidence is usually more nuanced.",
                  found[:8], min(12, 3 * len(found)))
 
     found = _find_terms(VAGUE_SOURCING, lowered)
+    mark(found, "vague")
     if found:
         add_flag("Vague or unnamed sources",
                  "Claims attributed to unnamed 'experts' or 'sources' cannot be checked.",
                  found[:8], min(18, 6 * len(found)))
 
     found = _find_terms(CONSPIRACY, lowered)
+    mark(found, "conspiracy")
     if found:
         add_flag("Conspiracy-style language",
                  "Phrases claiming that someone is hiding or suppressing the truth are typical of misleading content.",
                  found[:8], min(18, 6 * len(found)))
 
     found = _find_terms(CALL_TO_ACTION, lowered)
+    mark(found, "pressure")
     if found:
         add_flag("Pressure to share",
                  "Urging readers to share immediately helps misinformation spread before it can be checked.",
@@ -217,7 +232,7 @@ def analyze(text, headline=""):
                  "The text does not name any people, institutions, quotes, links or figures that you could check.",
                  [], 15)
 
-    score = max(0, min(100, red_points - cred_points))
+    score = max(0, min(100, int(round(red_points * strictness - cred_points))))
     if score < 25:
         verdict = "Few warning signs"
     elif score < 50:
@@ -241,7 +256,19 @@ def analyze(text, headline=""):
         checklist.append("Do not share it until you have verified it, even if it says it will be deleted.")
     checklist.append("If there is a photo or video, run a reverse image search (Google Lens or TinEye) to see if it is old or from another event.")
 
+    sentences = max(1, len(re.findall(r"[.!?]+(?:\s|$)", text)))
+    stats = {
+        "words": len(words),
+        "sentences": sentences,
+        "avg_sentence_words": round(len(words) / float(sentences), 1),
+        "reading_minutes": max(1, int(math.ceil(len(words) / 200.0))),
+        "caps_words": len(caps),
+        "exclamations": exclaims,
+    }
+
     return {
+        "highlights": highlights,
+        "stats": stats,
         "score": score,
         "verdict": verdict,
         "red_flags": red_flags,
@@ -253,3 +280,51 @@ def analyze(text, headline=""):
             "credibility_points": cred_points,
         },
     }
+
+
+def highlight_html(text, highlights):
+    """Return HTML-safe text with flagged phrases wrapped in <mark> tags."""
+    safe = html.escape(text or "", quote=False)
+    cat_of = {}
+    for term, cat in highlights:
+        cat_of.setdefault(term.lower(), cat)
+    if cat_of:
+        terms = sorted(cat_of, key=len, reverse=True)
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9])(" + "|".join(re.escape(t) for t in terms) + r")(?![A-Za-z0-9])", re.IGNORECASE
+        )
+
+        def repl(match):
+            cat = cat_of.get(match.group(1).lower(), "caps")
+            return '<mark class="fn-' + cat + '">' + match.group(1) + "</mark>"
+
+        safe = pattern.sub(repl, safe)
+    return safe.replace("\n", "<br>")
+
+
+def build_report(result, headline=""):
+    """Plain-text report for download."""
+    lines = ["AI FAKE NEWS ANALYZER - REPORT", "=" * 32, ""]
+    if headline:
+        lines.append("Headline: " + headline)
+    lines.append("Warning score: " + str(result["score"]) + "/100 (" + result["verdict"] + ")")
+    lines.append("Note: this checks writing style and sourcing only. It cannot confirm that a claim is true or false.")
+    lines += ["", "RED FLAGS"]
+    if result["red_flags"]:
+        for f in result["red_flags"]:
+            line = "- " + f["title"] + " (+" + str(f["points"]) + "): " + f["explanation"]
+            if f["examples"]:
+                line += " Found: " + ", ".join(f["examples"])
+            lines.append(line)
+    else:
+        lines.append("- None detected")
+    lines += ["", "CREDIBILITY SIGNALS"]
+    if result["credibility"]:
+        for c in result["credibility"]:
+            lines.append("- " + c["title"] + " (-" + str(c["points"]) + "): " + c["detail"])
+    else:
+        lines.append("- None detected")
+    lines += ["", "HOW TO VERIFY"]
+    for item in result["checklist"]:
+        lines.append("- " + item)
+    return "\n".join(lines) + "\n"
